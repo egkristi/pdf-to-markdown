@@ -43,11 +43,11 @@ This project aims to extract markdown-formatted content from PDF files, specific
 
 1. Clone the repository:
    ```
-   git clone https://github.com/iamarunbrahma/pdf-to-markdown.git
+   git clone https://github.com/egkristi/pdf-to-markdown.git
    cd pdf-to-markdown
    ```
 
-2. Create a virtual environment (optional but recommended):
+2. Create a virtual environment (optional, not necessary if using UV):
    ```
    python -m venv venv
    source venv/bin/activate
@@ -56,6 +56,12 @@ This project aims to extract markdown-formatted content from PDF files, specific
 3. Install the required packages:
    ```
    pip install -r requirements.txt
+   ```
+   
+   **Alternative: Using UV** (faster dependency management):
+   ```
+   pip install uv
+   uv sync --no-install-project
    ```
 
 4. Install Tesseract OCR:
@@ -69,6 +75,11 @@ Run the script with the path to your PDF file as an argument:
 
 ```
 python extract.py --pdf_path path/to/your/file.pdf
+```
+
+Or if using UV:
+```
+uv run python extract.py --pdf_path path/to/your/file.pdf
 ```
 
 The extracted markdown content will be saved in the `outputs` directory with the same name as the input PDF file, but with a `.md` extension.
