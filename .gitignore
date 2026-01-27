@@ -1,3 +1,4 @@
-# UV
 .venv/
+logs/
+outputs/
 uv.lock
