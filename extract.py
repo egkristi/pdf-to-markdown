@@ -10,7 +10,6 @@ import torch
 from PIL import Image
 import os
 import logging
-import traceback
 import warnings
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -18,20 +17,25 @@ import argparse
 
 warnings.filterwarnings("ignore")
 
-with open(Path("config/config.yaml").resolve(), "r", encoding="utf-8") as f:
+# Resolve config relative to this script, not CWD
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_CONFIG_PATH = _SCRIPT_DIR / "config" / "config.yaml"
+
+with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 
 class PDFExtractor(ABC):
     """Abstract base class for PDF extraction."""
 
-    def __init__(self, pdf_path):
+    def __init__(self, pdf_path, output_dir=None):
         self.pdf_path = pdf_path
+        self.output_dir = Path(output_dir) if output_dir else Path(config["OUTPUT_DIR"])
         self.setup_logging()
 
     def setup_logging(self):
         """Set up logging configuration."""
-        log_dir = Path(__file__).parent / "logs"
+        log_dir = Path(__file__).resolve().parent / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"{Path(__file__).stem}.log"
 
@@ -56,43 +60,49 @@ class MarkdownPDFExtractor(PDFExtractor):
 
     BULLET_POINTS = "•◦▪▫●○"
 
-    def __init__(self, pdf_path):
-        super().__init__(pdf_path)
+    def __init__(self, pdf_path, output_dir=None):
+        super().__init__(pdf_path, output_dir)
         self.pdf_filename = Path(pdf_path).stem
-        Path(config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
-        self.setup_image_captioning()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Lazy-loaded model (only initialized when first image is encountered)
+        self._model = None
+        self._feature_extractor = None
+        self._tokenizer = None
+        self._device = None
 
-    def setup_image_captioning(self):
-        """Set up the image captioning model."""
+    def _ensure_captioning_model(self):
+        """Lazy-load the image captioning model on first use."""
+        if self._model is not None:
+            return True
         try:
-            self.model = VisionEncoderDecoderModel.from_pretrained(
+            self._model = VisionEncoderDecoderModel.from_pretrained(
                 "nlpconnect/vit-gpt2-image-captioning"
             )
-            self.feature_extractor = ViTImageProcessor.from_pretrained(
+            self._feature_extractor = ViTImageProcessor.from_pretrained(
                 "nlpconnect/vit-gpt2-image-captioning"
             )
-            self.tokenizer = AutoTokenizer.from_pretrained(
+            self._tokenizer = AutoTokenizer.from_pretrained(
                 "nlpconnect/vit-gpt2-image-captioning"
             )
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model.to(self.device)
-            self.logger.info("Image captioning model set up successfully.")
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._model.to(self._device)
+            self.logger.info("Image captioning model loaded successfully.")
+            return True
         except Exception as e:
-            self.logger.error(f"Error setting up image captioning model: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error loading image captioning model: {e}")
+            return False
 
     def extract(self):
         try:
             markdown_content, markdown_pages = self.extract_markdown()
             self.save_markdown(markdown_content)
             self.logger.info(
-                f"Markdown content has been saved to {Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md"
+                f"Markdown content saved to {self.output_dir / self.pdf_filename}.md"
             )
             return markdown_content, markdown_pages
 
         except Exception as e:
-            self.logger.error(f"Error processing PDF: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error processing PDF: {e}", exc_info=True)
             return "", []
 
     def extract_markdown(self):
@@ -103,11 +113,13 @@ class MarkdownPDFExtractor(PDFExtractor):
             markdown_pages = []
             tables = self.extract_tables()
             table_index = 0
-            list_counter = 0
-            in_code_block = False
-            code_block_content = ""
-            code_block_lang = None
-            prev_line = ""
+
+            # Persistent state across blocks and pages
+            self._list_counter = 0
+            self._in_code_block = False
+            self._code_block_content = ""
+            self._code_block_lang = None
+            self._prev_line = ""
 
             for page_num, page in enumerate(doc):
                 self.logger.info(f"Processing page {page_num + 1}")
@@ -115,36 +127,15 @@ class MarkdownPDFExtractor(PDFExtractor):
                 blocks = page.get_text("dict")["blocks"]
                 page_height = page.rect.height
                 links = self.extract_links(page)
+                has_images = 0 < len(page.get_images()) <= 128
 
-                if len(page.get_images()) > 0 and len(page.get_images()) <= 128:
-                    for block in blocks:
-                        if block["type"] == 0:  # Text
-                            page_content += self.process_text_block(
-                                block,
-                                page_height,
-                                links,
-                                list_counter,
-                                in_code_block,
-                                code_block_content,
-                                code_block_lang,
-                                prev_line,
-                            )
-                        elif block["type"] == 1:  # Image
-                            page_content += self.process_image_block(page, block)
-
-                else:
-                    for block in blocks:
-                        if block["type"] == 0:  # Text
-                            page_content += self.process_text_block(
-                                block,
-                                page_height,
-                                links,
-                                list_counter,
-                                in_code_block,
-                                code_block_content,
-                                code_block_lang,
-                                prev_line,
-                            )
+                for block in blocks:
+                    if block["type"] == 0:  # Text
+                        page_content += self.process_text_block(
+                            block, page_height, links
+                        )
+                    elif block["type"] == 1 and has_images:  # Image
+                        page_content += self.process_image_block(page, block)
 
                 # Insert tables at their approximate positions
                 while (
@@ -164,8 +155,7 @@ class MarkdownPDFExtractor(PDFExtractor):
             markdown_content = self.post_process_markdown(markdown_content)
             return markdown_content, markdown_pages
         except Exception as e:
-            self.logger.error(f"Error extracting markdown: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error extracting markdown: {e}", exc_info=True)
             return "", []
 
     def extract_tables(self):
@@ -181,8 +171,7 @@ class MarkdownPDFExtractor(PDFExtractor):
                         tables.append({"page": page_number, "content": table})
             self.logger.info(f"Extracted {len(tables)} tables from the PDF.")
         except Exception as e:
-            self.logger.error(f"Error extracting tables: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error extracting tables: {e}", exc_info=True)
         return tables
 
     def table_to_markdown(self, table):
@@ -213,8 +202,7 @@ class MarkdownPDFExtractor(PDFExtractor):
 
             return markdown
         except Exception as e:
-            self.logger.error(f"Error converting table to markdown: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error converting table to markdown: {e}", exc_info=True)
             return ""
 
     def perform_ocr(self, image):
@@ -225,47 +213,38 @@ class MarkdownPDFExtractor(PDFExtractor):
                 opencv_image, output_type=pytesseract.Output.DICT
             )
 
-            result = ""
-            for word in ocr_result["text"]:
-                if word.strip() != "":
-                    result += word + " "
-
-                if len(result) > 30:
-                    break
-
-            return result.strip()
+            words = [w.strip() for w in ocr_result["text"] if w.strip()]
+            return " ".join(words)
         except Exception as e:
-            self.logger.error(f"Error performing OCR: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error performing OCR: {e}", exc_info=True)
             return ""
 
     def caption_image(self, image):
-        """Generate a caption for the given image."""
+        """Generate a caption for the given image using OCR or AI model."""
         try:
             ocr_text = self.perform_ocr(image)
             if ocr_text:
                 return ocr_text
 
+            if not self._ensure_captioning_model():
+                return ""
+
             # Convert image to RGB if it's not already
             if image.mode != "RGB":
                 image = image.convert("RGB")
 
-            # Ensure the image is in the correct shape
-            image = np.array(image).transpose(2, 0, 1)  # Convert to (C, H, W) format
-
-            inputs = self.feature_extractor(images=image, return_tensors="pt").to(
-                self.device
+            inputs = self._feature_extractor(images=image, return_tensors="pt").to(
+                self._device
             )
             pixel_values = inputs.pixel_values
 
-            generated_ids = self.model.generate(pixel_values, max_length=30)
-            generated_caption = self.tokenizer.batch_decode(
+            generated_ids = self._model.generate(pixel_values, max_length=30)
+            generated_caption = self._tokenizer.batch_decode(
                 generated_ids, skip_special_tokens=True
             )[0]
             return generated_caption.strip()
         except Exception as e:
-            self.logger.error(f"Error captioning image: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error captioning image: {e}", exc_info=True)
             return ""
 
     def clean_text(self, text):
@@ -309,7 +288,8 @@ class MarkdownPDFExtractor(PDFExtractor):
     def convert_bullet_to_markdown(self, text):
         """Convert a bullet point to markdown format."""
         text = re.sub(r"^\s*", "", text)
-        return re.sub(f"^[{re.escape(self.BULLET_POINTS)}]\s*", "- ", text)
+        pattern = r"^[" + re.escape(self.BULLET_POINTS) + r"]\s*"
+        return re.sub(pattern, "- ", text)
 
     def is_numbered_list_item(self, text):
         """Check if the given text is a numbered list item."""
@@ -333,8 +313,7 @@ class MarkdownPDFExtractor(PDFExtractor):
                     links.append({"rect": link["from"], "uri": link["uri"]})
             self.logger.info(f"Extracted {len(links)} links from the page.")
         except Exception as e:
-            self.logger.error(f"Error extracting links: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error extracting links: {e}", exc_info=True)
         return links
 
     def detect_code_block(self, prev_line, current_line):
@@ -408,17 +387,7 @@ class MarkdownPDFExtractor(PDFExtractor):
 
         return None
 
-    def process_text_block(
-        self,
-        block,
-        page_height,
-        links,
-        list_counter,
-        in_code_block,
-        code_block_content,
-        code_block_lang,
-        prev_line,
-    ):
+    def process_text_block(self, block, page_height, links):
         """Process a text block and convert it to markdown."""
         try:
             block_rect = block["bbox"]
@@ -496,61 +465,60 @@ class MarkdownPDFExtractor(PDFExtractor):
             for i, line in enumerate(lines):
                 clean_line = self.clean_text(line)
 
-                if not in_code_block:
-                    code_lang = self.detect_code_block(prev_line, clean_line)
+                if not self._in_code_block:
+                    code_lang = self.detect_code_block(self._prev_line, clean_line)
                     if code_lang:
-                        in_code_block = True
-                        code_block_lang = code_lang
-                        code_block_content = prev_line + "\n" + clean_line + "\n"
-                        prev_line = clean_line
+                        self._in_code_block = True
+                        self._code_block_lang = code_lang
+                        self._code_block_content = self._prev_line + "\n" + clean_line + "\n"
+                        self._prev_line = clean_line
                         continue
 
-                if in_code_block:
-                    code_block_content += clean_line + "\n"
+                if self._in_code_block:
+                    self._code_block_content += clean_line + "\n"
                     if (
                         i == len(lines) - 1
                         or self.detect_code_block(clean_line, lines[i + 1])
-                        != code_block_lang
+                        != self._code_block_lang
                     ):
                         markdown_content += (
-                            f"```{code_block_lang}\n{code_block_content}```\n\n"
+                            f"```{self._code_block_lang}\n{self._code_block_content}```\n\n"
                         )
-                        in_code_block = False
-                        code_block_content = ""
-                        code_block_lang = None
+                        self._in_code_block = False
+                        self._code_block_content = ""
+                        self._code_block_lang = None
                 else:
                     if self.is_bullet_point(clean_line):
                         markdown_content += "\n" + self.convert_bullet_to_markdown(
                             clean_line
                         )
-                        list_counter = 0
+                        self._list_counter = 0
                     elif self.is_numbered_list_item(clean_line):
-                        list_counter += 1
+                        self._list_counter += 1
                         markdown_content += (
                             "\n"
                             + self.convert_numbered_list_to_markdown(
-                                clean_line, list_counter
+                                clean_line, self._list_counter
                             )
                         )
                     else:
                         markdown_content += f"{clean_line}\n"
-                        list_counter = 0
+                        self._list_counter = 0
 
-                prev_line = clean_line
+                self._prev_line = clean_line
 
             return markdown_content + "\n"
         except Exception as e:
-            self.logger.error(f"Error processing text block: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error processing text block: {e}", exc_info=True)
             return ""
 
     def process_image_block(self, page, block):
         """Process an image block and convert it to markdown."""
         try:
             image_rect = block["bbox"]
-            zoom_x = 2.0  # horizontal zoom
-            zoom_y = 2.0  # vertical zoom
-            mat = fitz.Matrix(zoom_x, zoom_y)  # zoom factor 2 in each dimension
+            zoom_x = 2.0
+            zoom_y = 2.0
+            mat = fitz.Matrix(zoom_x, zoom_y)
             pix = page.get_pixmap(clip=image_rect, matrix=mat, alpha=False)
             image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
@@ -560,9 +528,7 @@ class MarkdownPDFExtractor(PDFExtractor):
             image_filename = (
                 f"{self.pdf_filename}_image_{int(page.number)+1}_{block['number']}.png"
             )
-            image_path = (
-                Path(config["OUTPUT_DIR"]) / image_filename
-            )  # Convert to Path object
+            image_path = self.output_dir / image_filename
             image.save(image_path, "PNG", optimize=True, quality=95)
 
             caption = self.caption_image(image)
@@ -571,10 +537,9 @@ class MarkdownPDFExtractor(PDFExtractor):
                     f"{self.pdf_filename}_image_{int(page.number)+1}_{block['number']}"
                 )
 
-            return f"![{caption}]({image_path})\n\n"  # image_path is now a Path object
+            return f"![{caption}]({image_filename})\n\n"
         except Exception as e:
-            self.logger.error(f"Error processing image block: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error processing image block: {e}", exc_info=True)
             return ""
 
     def get_header_level(self, font_size):
@@ -601,8 +566,8 @@ class MarkdownPDFExtractor(PDFExtractor):
                 r"\n{3,}", "\n\n", markdown_content
             )  # Remove excessive newlines
             markdown_content = re.sub(
-                r"(\d+)\s*\n", "", markdown_content
-            )  # Remove page numbers
+                r"^\s*\d{1,4}\s*$", "", markdown_content, flags=re.MULTILINE
+            )  # Remove standalone page numbers (lines that are ONLY a number)
             markdown_content = re.sub(
                 r" +", " ", markdown_content
             )  # Remove multiple spaces
@@ -628,24 +593,18 @@ class MarkdownPDFExtractor(PDFExtractor):
             )  # Remove headers in the middle of lines
             return markdown_content
         except Exception as e:
-            self.logger.error(f"Error post-processing markdown: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error post-processing markdown: {e}", exc_info=True)
             return markdown_content
 
     def save_markdown(self, markdown_content):
         """Save the markdown content to a file."""
         try:
-            os.makedirs(Path(config["OUTPUT_DIR"]), exist_ok=True)
-            with open(
-                f"{Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md",
-                "w",
-                encoding="utf-8",
-            ) as f:
-                f.write(markdown_content)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = self.output_dir / f"{self.pdf_filename}.md"
+            output_path.write_text(markdown_content, encoding="utf-8")
             self.logger.info("Markdown content saved successfully.")
         except Exception as e:
-            self.logger.error(f"Error saving markdown content: {e}")
-            self.logger.exception(traceback.format_exc())
+            self.logger.error(f"Error saving markdown content: {e}", exc_info=True)
 
 
 def main():
@@ -653,11 +612,16 @@ def main():
         description="Extract markdown-formatted content from a PDF file."
     )
     parser.add_argument("--pdf_path", help="Path to the input PDF file", required=True)
+    parser.add_argument(
+        "--output-dir",
+        help="Output directory for markdown and images (default: from config)",
+        default=None,
+    )
     args = parser.parse_args()
 
-    extractor = MarkdownPDFExtractor(args.pdf_path)
-    markdown_pages = extractor.extract()
-    return markdown_pages
+    extractor = MarkdownPDFExtractor(args.pdf_path, output_dir=args.output_dir)
+    markdown_content, markdown_pages = extractor.extract()
+    return markdown_content, markdown_pages
 
 
 if __name__ == "__main__":
